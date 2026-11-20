@@ -56,7 +56,25 @@ const unsigned long HTTP_TIMEOUT = 5000; // how long to wait for PVoutput to rep
 // results from updatePVoutput()
 #define PVOUTPUT_OK 0
 #define PVOUTPUT_NO_CONNECTION 1 // couldn't reach the server, worth trying again
-#define PVOUTPUT_ERROR 2 // no inverter data, or the server rejected the update
+#define PVOUTPUT_ERROR 2 // no inverter data, or the server rejected or didn't answer the update
+
+// collects the HTTP request so it can be sent to PVoutput in one go, because the Ethernet
+// library sends every write() as its own network packet and print(F(...)) writes one character at a time
+class RequestBuffer : public Print {
+public:
+  char text[256];
+  size_t length;
+  boolean overflow;
+  RequestBuffer() : length(0), overflow(false) {}
+  size_t write(uint8_t c) {
+    if (length >= sizeof(text)) {
+      overflow = true;
+      return 0;
+    }
+    text[length++] = c;
+    return 1;
+  }
+};
 
 // initialise the Ethernet client library
 EthernetClient client;
@@ -197,74 +215,78 @@ int updatePVoutput() {
     return PVOUTPUT_ERROR;
   }
   
+  RequestBuffer request;
+  request.print(F("GET /service/r2/addstatus.jsp?key="));
+  request.print(apiKey);
+  request.print(F("&sid="));
+  request.print(sid);
+
+  // send date as yyyymmdd
+  request.print(F("&d="));
+  request.print(year(t));
+  printTwoDigits(request, month(t));
+  printTwoDigits(request, day(t));
+
+  // send time as hh:mm
+  request.print(F("&t="));
+  printTwoDigits(request, hour(t));
+  request.print(':');
+  printTwoDigits(request, minute(t));
+
+  // send Energy Generation in watt hours, example "10000"
+  if (haveWhToday) {
+    request.print(F("&v1="));
+    request.print(whToday);
+  }
+
+  // send Power Generation in watts, example "1000"
+  if (havePout) {
+    request.print(F("&v2="));
+    request.print(pout);
+  }
+
+  // send Temperature in celsius, example "23.4"
+  if (haveTemp) {
+    request.print(F("&v5="));
+    request.print(temp);
+  }
+
+  // send Voltage in volts, example "240.0"
+  if (haveVoltage) {
+    request.print(F("&v6="));
+    request.print(voltage);
+  }
+
+  // finish HTTP GET request
+  request.println(F(" HTTP/1.0"));
+  request.print(F("Host: "));
+  request.println(serverName);
+  request.println();
+  if (request.overflow) {
+    Serial.println(F("request too long"));
+    return PVOUTPUT_ERROR;
+  }
+
   // connect() returns 1 when connected, and 0 or a negative number (e.g. a failed DNS lookup) when not
   if (client.connect(serverName, 80) != 1) {
     Serial.println(F("connection failed"));
     client.stop();
     return PVOUTPUT_NO_CONNECTION;
   }
-
-  client.print(F("GET /service/r2/addstatus.jsp?key="));
-  client.print(apiKey);
-  client.print(F("&sid="));
-  client.print(sid);
-
-  // send date as yyyymmdd
-  client.print(F("&d="));
-  client.print(year(t));
-  printTwoDigits(client, month(t));
-  printTwoDigits(client, day(t));
-
-  // send time as hh:mm
-  client.print(F("&t="));
-  printTwoDigits(client, hour(t));
-  client.print(':');
-  printTwoDigits(client, minute(t));
-
-  // send Energy Generation in watt hours, example "10000"
-  if (haveWhToday) {
-    client.print(F("&v1="));
-    client.print(whToday);
-  }
-
-  // send Power Generation in watts, example "1000"
-  if (havePout) {
-    client.print(F("&v2="));
-    client.print(pout);
-  }
-
-  // send Temperature in celsius, example "23.4"
-  if (haveTemp) {
-    client.print(F("&v5="));
-    client.print(temp);
-  }
-
-  // send Voltage in volts, example "240.0"
-  if (haveVoltage) {
-    client.print(F("&v6="));
-    client.print(voltage);
-  }
-
-  // finish HTTP GET request
-  client.println(F(" HTTP/1.0"));
-  client.print(F("Host: "));
-  client.println(serverName);
-  client.println();
+  client.write((const uint8_t *)request.text, request.length);
 
   // the first line of the reply is the status, e.g. "HTTP/1.1 200 OK"
   char status[32];
   client.setTimeout(HTTP_TIMEOUT);
   int len = client.readBytesUntil('\n', status, sizeof(status) - 1);
   status[len] = '\0';
-  int result;
   if (len == 0) {
+    // don't send it again, the server may have got the update even though it didn't reply
     Serial.println(F("no reply from server"));
-    result = PVOUTPUT_NO_CONNECTION;
-  } else if (strstr(status, " 200") != NULL) {
-    result = PVOUTPUT_OK;
-  } else {
-    result = PVOUTPUT_ERROR;
+    client.stop();
+    return PVOUTPUT_ERROR;
   }
+  int result = strstr(status, " 200") != NULL ? PVOUTPUT_OK : PVOUTPUT_ERROR;
   Serial.println(status);
 
   // print the rest of the reply from the server
@@ -309,8 +331,9 @@ boolean getTimeAndDate() {
   // wait up to 1.5 seconds for the reply
   unsigned long start = millis();
   while (millis() - start < 1500) {
-    // anything shorter than a full NTP packet isn't a reply, and is thrown away by the next parsePacket()
-    if (Udp.parsePacket() >= NTP_PACKET_SIZE) {
+    // anything shorter than a full NTP packet, or not from the NTP port, isn't a reply,
+    // and is thrown away by the next parsePacket()
+    if (Udp.parsePacket() >= NTP_PACKET_SIZE && Udp.remotePort() == 123) {
       Udp.read(packetBuffer,NTP_PACKET_SIZE);  // read the packet into the buffer
       // only trust a reply from a server (mode 4) that is synchronised (stratum 1 to 15)
       byte mode = packetBuffer[0] & 0x07;
@@ -319,11 +342,11 @@ boolean getTimeAndDate() {
       unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
       unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
       unsigned long secsSince1900 = highWord << 16 | lowWord;
-      if (mode != 4 || stratum < 1 || stratum > 15 || secsSince1900 == 0) {
-        return false; // not a usable reply
+      if (mode == 4 && stratum >= 1 && stratum <= 15 && secsSince1900 != 0) {
+        setTime(secsSince1900 - 2208988800UL + timeZoneOffset);
+        return true;
       }
-      setTime(secsSince1900 - 2208988800UL + timeZoneOffset);
-      return true;
+      // not a usable reply, keep waiting rather than asking the server again straight away
     }
   }
   return false;
