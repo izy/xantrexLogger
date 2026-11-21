@@ -53,6 +53,8 @@ unsigned int PVoutputOfflineTime = 60; // how often to check an offline inverter
 unsigned long PVoutputLastCheck = 0; // millis() when we last checked the inverter
 unsigned int PVoutputWaitTime = 0; // seconds to wait after PVoutputLastCheck, 0 so the first check happens straight away
 const unsigned long HTTP_TIMEOUT = 5000; // how long to wait for PVoutput to reply in milliseconds
+const int PVOUTPUT_TRIES = 3; // how many times to try reaching PVoutput for each update
+const unsigned long PVOUTPUT_RETRY_DELAY = 5000; // pause between tries in milliseconds
 // results from updatePVoutput()
 #define PVOUTPUT_OK 0
 #define PVOUTPUT_NO_CONNECTION 1 // couldn't reach the server, worth trying again
@@ -89,6 +91,8 @@ SoftwareSerial xantrexSerial(rxPin,txPin);
 const int MAXTRIES = 20;
 // how long to wait for the inverter to reply in milliseconds
 const unsigned long INVERTER_TIMEOUT = 200;
+// pause before each command in milliseconds, so the inverter has finished its last reply
+const unsigned long INVERTER_GAP = 20;
 // longest reply we keep from the inverter
 const int REPLY_SIZE = 32;
 
@@ -127,8 +131,9 @@ void loop() {
     } else if (get_status() == 1) {
       PVoutputWaitTime = PVoutputUpdateTime; // if the inverter is online we go back to the normal update time
       // only try again if we couldn't reach the server, PVoutput limits how many requests we can make
-      int result = PVOUTPUT_NO_CONNECTION;
-      for (int trys = 0; trys < 10 && result == PVOUTPUT_NO_CONNECTION; trys++) {
+      int result = updatePVoutput();
+      for (int trys = 1; trys < PVOUTPUT_TRIES && result == PVOUTPUT_NO_CONNECTION; trys++) {
+        delay(PVOUTPUT_RETRY_DELAY);
         result = updatePVoutput();
       }
       if (result == PVOUTPUT_OK) {
@@ -407,7 +412,8 @@ void printTwoDigits(Print &out, int value) {
 // send a command to the inverter and read the first line of its reply
 // returns false if the inverter didn't reply in time
 boolean queryInverter(const __FlashStringHelper *command, char *reply, int size) {
-  // throw away anything left over from an earlier command
+  // give the inverter a moment to finish its last reply, then throw away anything left over
+  delay(INVERTER_GAP);
   while (xantrexSerial.available() > 0) {
     xantrexSerial.read();
   }
